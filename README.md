@@ -27,6 +27,13 @@
 <br>
 <br>
 
+> **Fork notice (Rutgers LCSR).** This is a fork of
+> [initMAX/zabbix-mcp-server](https://github.com/initMAX/zabbix-mcp-server)
+> that lets an authentication gateway pass each user's own Zabbix API token
+> per request, so Zabbix enforces that user's permissions on every call.
+> See [FORK.md](FORK.md) for the configuration and the list of changed
+> files. Everything below is upstream's documentation.
+
 ## Table of Contents
 
 <p align="center">
