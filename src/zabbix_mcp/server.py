@@ -3341,6 +3341,15 @@ def run_server(
             asgi_app = _make_request_context_middleware(
                 asgi_app, config.server.trusted_proxies or [])
 
+            # Fork (rutgers-lcsr): per-user Zabbix identity from an auth gateway.
+            if config.server.zabbix_token_header:
+                from zabbix_mcp.gateway_auth import make_zabbix_token_middleware
+                asgi_app = make_zabbix_token_middleware(
+                    asgi_app, config.server.zabbix_token_header,
+                    config.server.trusted_proxies or [])
+                logger.info("Per-user Zabbix tokens accepted via %s from trusted proxies",
+                            config.server.zabbix_token_header)
+
             # Apply IP allowlist middleware if configured
             if config.server.allowed_hosts:
                 asgi_app = _IPAllowlistMiddleware(asgi_app, config.server.allowed_hosts)
