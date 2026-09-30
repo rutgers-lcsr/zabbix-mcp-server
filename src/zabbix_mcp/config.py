@@ -104,6 +104,14 @@ class ServerConfig:
     # ever use the raw TCP peer. Populate with e.g. ["127.0.0.1"] when
     # running behind nginx on localhost.
     trusted_proxies: list[str] | None = None
+    # Name of the HTTP header an authentication gateway uses to hand this
+    # server the calling user's own Zabbix API token, e.g.
+    # "X-Zabbix-Token". When set, every Zabbix call made while the header
+    # is present runs as that user instead of the shared
+    # [zabbix.<name>].api_token, so Zabbix roles and host group
+    # permissions apply to the caller. The header is only honoured from
+    # a peer in ``trusted_proxies``. Unset (default) = feature off.
+    zabbix_token_header: str | None = None
     compact_output: bool = True
     response_max_chars: int = 50000
     # Freshness hint (seconds) attached to tools/list results as the
@@ -586,6 +594,18 @@ def load_config(path: str | Path) -> AppConfig:
             raise ConfigError("'trusted_proxies' must be a list of IP addresses")
         trusted_proxies = [str(h) for h in trusted_proxies_raw]
 
+    zabbix_token_header_raw = server_raw.get("zabbix_token_header")
+    zabbix_token_header: str | None = None
+    if zabbix_token_header_raw is not None:
+        if not isinstance(zabbix_token_header_raw, str) or not zabbix_token_header_raw.strip():
+            raise ConfigError("'zabbix_token_header' must be a non-empty HTTP header name")
+        zabbix_token_header = zabbix_token_header_raw.strip()
+        if not trusted_proxies:
+            raise ConfigError(
+                "'zabbix_token_header' requires 'trusted_proxies': the header is only "
+                "honoured from a listed proxy, so without one it can never take effect"
+            )
+
     log_file = server_raw.get("log_file")
 
     compact_output_raw = server_raw.get("compact_output", True)
@@ -620,6 +640,7 @@ def load_config(path: str | Path) -> AppConfig:
         allowed_hosts=allowed_hosts,
         allowed_origins=allowed_origins,
         trusted_proxies=trusted_proxies,
+        zabbix_token_header=zabbix_token_header,
         compact_output=compact_output_raw,
         response_max_chars=response_max_chars_raw,
         tools_list_cache_ttl=tools_cache_ttl_raw,
