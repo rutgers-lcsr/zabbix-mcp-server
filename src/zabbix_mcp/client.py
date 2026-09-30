@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import ssl
@@ -27,7 +28,7 @@ import time
 from typing import Any
 
 from zabbix_utils import ZabbixAPI
-from zabbix_utils.exceptions import ProcessingError
+from zabbix_utils.exceptions import APIRequestError, ProcessingError
 
 # OpenSSL 3.0 (RHEL 9, Ubuntu 22.04+) disables unsafe legacy
 # renegotiation by default. Some older Zabbix HTTPS frontends still
@@ -99,6 +100,7 @@ except Exception:
     pass
 
 from zabbix_mcp.config import AppConfig, ZabbixServerConfig
+from zabbix_mcp.gateway_auth import current_zabbix_token
 
 logger = logging.getLogger("zabbix_mcp.client")
 
@@ -109,6 +111,14 @@ class ReadOnlyError(Exception):
 
 class RateLimitError(Exception):
     """Raised when the rate limit is exceeded."""
+
+
+class ZabbixTokenRejected(ValueError):
+    """Raised when the per-user Zabbix token from the gateway cannot be used.
+
+    Subclasses ``ValueError`` so the tool handlers in ``server.py`` surface
+    the message to the caller as a ``ToolError`` without any change there.
+    """
 
 
 class _RateLimiter:
@@ -169,6 +179,11 @@ class ClientManager:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._clients: dict[str, ZabbixAPI] = {}
+        # Per-user clients for requests carrying a gateway Zabbix token
+        # (see gateway_auth.py): (server, sha256(token)) -> [client,
+        # last-used monotonic time]. Idle entries are evicted so a revoked
+        # token does not linger and memory stays bounded.
+        self._user_clients: dict[tuple[str, str], list[Any]] = {}
         self._versions: dict[str, str] = {}
         self._rate_limiter = _RateLimiter(config.server.rate_limit)
         self._lock = threading.RLock()
@@ -209,6 +224,14 @@ class ClientManager:
         # ZabbixAPI constructor and plumbs it through to urllib. The
         # 300 s default matches Zabbix PHP frontend's max_execution_time
         # so expensive exports / long history.get ranges can complete.
+        api = self._new_api(srv, srv.api_token)
+
+        version = api.api_version()
+        logger.info("Connected to '%s' - Zabbix %s", name, version)
+        return api
+
+    @staticmethod
+    def _new_api(srv: ZabbixServerConfig, token: str) -> ZabbixAPI:
         timeout = getattr(srv, "request_timeout", 300) or 300
         api = ZabbixAPI(
             url=srv.url,
@@ -216,14 +239,50 @@ class ClientManager:
             skip_version_check=srv.skip_version_check,
             timeout=timeout,
         )
-        api.login(token=srv.api_token)
-
-        version = api.api_version()
-        logger.info("Connected to '%s' - Zabbix %s", name, version)
+        api.login(token=token)
         return api
 
+    # Idle time after which a per-user client is dropped.
+    _USER_CLIENT_IDLE = 15 * 60.0
+
+    def _user_client(self, name: str, token: str) -> ZabbixAPI:
+        """Get or create the client for a gateway-supplied user token."""
+        if not token:
+            raise ZabbixTokenRejected(
+                "The request carried an empty Zabbix token. Refusing to run as the "
+                "shared token; sign in again through the gateway."
+            )
+        key = (name, hashlib.sha256(token.encode("utf-8")).hexdigest())
+        now = time.monotonic()
+        with self._lock:
+            for k, entry in list(self._user_clients.items()):
+                if now - entry[1] > self._USER_CLIENT_IDLE:
+                    del self._user_clients[k]
+            entry = self._user_clients.get(key)
+            if entry is None:
+                srv = self.get_server_config(name)
+                logger.info("Connecting to Zabbix server '%s' as gateway user %s",
+                            name, key[1][:12])
+                entry = [self._new_api(srv, token), now]
+                self._user_clients[key] = entry
+            entry[1] = now
+            return entry[0]
+
+    def _drop_user_client(self, name: str, token: str) -> None:
+        key = (name, hashlib.sha256(token.encode("utf-8")).hexdigest())
+        with self._lock:
+            self._user_clients.pop(key, None)
+
     def _get_client(self, name: str) -> ZabbixAPI:
-        """Get or create a client for the given server."""
+        """Get or create a client for the given server.
+
+        A request carrying a gateway Zabbix token gets that user's client
+        instead of the shared one, so everything built on this method
+        (``get_version``, ``call``, extensions) runs as the user.
+        """
+        token = current_zabbix_token.get()
+        if token is not None:
+            return self._user_client(name, token)
         # Fast path: already connected, return without taking the lock.
         client = self._clients.get(name)
         if client is not None:
@@ -342,6 +401,9 @@ class ClientManager:
         """
         import ssl
         self._rate_limiter.check()
+        token = current_zabbix_token.get()
+        if token is not None:
+            return self._call_as_user(server, method, params, token)
         client = self._get_client(server)
         try:
             return self._do_call(client, method, params)
@@ -353,6 +415,31 @@ class ClientManager:
             raise
         except (ConnectionError, TimeoutError, ssl.SSLError, OSError):
             client = self._reconnect(server)
+            return self._do_call(client, method, params)
+
+    def _call_as_user(self, server: str, method: str, params: Any, token: str) -> Any:
+        """``call`` for a request carrying a gateway Zabbix token.
+
+        Never falls back to the shared token: an auth failure drops the
+        user's cached client and is reported as ``ZabbixTokenRejected``.
+        A dead socket is retried once with a fresh client for the same
+        token, mirroring the shared path.
+        """
+        client = self._user_client(server, token)
+        try:
+            return self._do_call(client, method, params)
+        except (ProcessingError, APIRequestError) as e:
+            error_msg = str(e).lower()
+            if "not authorised" in error_msg or "session" in error_msg or "re-login" in error_msg:
+                self._drop_user_client(server, token)
+                raise ZabbixTokenRejected(
+                    f"Zabbix rejected the user's API token: {e}. "
+                    "Sign in again through the gateway."
+                ) from e
+            raise
+        except (ConnectionError, TimeoutError, ssl.SSLError, OSError):
+            self._drop_user_client(server, token)
+            client = self._user_client(server, token)
             return self._do_call(client, method, params)
 
     # Strict format: "object.method" — only ASCII letters, single dot separator.
@@ -445,3 +532,4 @@ class ClientManager:
             except Exception:
                 logger.warning("Failed to disconnect from '%s'", name, exc_info=True)
         self._clients.clear()
+        self._user_clients.clear()
